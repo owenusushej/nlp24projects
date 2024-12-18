@@ -1,0 +1,126 @@
+### 作者同名消歧
+**摘要**
+本文主要研究同名消歧问题，具体是指：给定每位作者的个人资料，包括作者姓名和发表的论文，参赛者需要开发一个模型来检测论文中错误分配给该作者的论文。此外，数据集还提供了所有涉及论文的详细属性，包括标题、摘要、作者、关键词、地点和发表年份。
+在线出版物数量的迅速增加使得同名消歧问题变得更加复杂。此外，现有消歧系统的不准确导致了错误的作者排名和奖项作弊的情况。希望开发一个模型来发现给定作者的论文分配错误。
+在科学研究和学术出版中，作者消歧是一个重要的问题，因为不同作者可能具有相同的名字，导致混淆。本文根据待消歧论文中两种类型的特征（语义特征和关系特征），分别运用不同的特征表示方法，得到每篇论文中的两种特征表示向量，结合两种特征表示向量并基于相关的聚类算法和规则匹配将论文划分给具体的作者。最终在验证数据和测试数据上都取得不错的结果。
+
+最终结果
+![alt text](image-1.png)
+
+#### baseline代码分析
+基线代码将数据提取为离散与语义特征，离散为论文间的关系如一起发表论文的作者，和相同的机构，语义指摘要和标题等具有论文内容实际信息的特征。根据数据分析和特征分析结果：离散特征可以转化为两片论文的关系，比如A，B论文有共同作者，共同发表会议等，可以构图表示此关系，并使用图嵌入方式得到论文之间的关系表征向量，对于语义特征就可以用词嵌入方法获得词向量。因此对于每一个需要消歧的名字，可以结合其语义表征向量和关系表征向量，再计算两两相似度得到各论文之间的相似度矩阵，根据此相似度举证再结合聚类算法，据称不同的簇，相同簇中论文之间相似度较高。每个簇就代表一个具体的作者。
+以下为概括的流程图
+![alt text](image-2.png)
+
+为什么不使用baseline代码
+baseline代码的效果很多，在最初版本就可以达到0.71的准确率分数，但baseline代码在处理作者关系图的时候是每一个作者生成一个模型图，而数据有70w+条，开销过大，电脑常常在没跑到聚类部分内存就满了。
+在代码描述中也提到baseline代码最好使用两张A100来执行
+综合以上因素，没有使用baseline代码转而使用数据挖掘进行进一步的研究
+
+#### 整体思路
+对于某个需要消歧的论文，根据，求出作者与
+整体框架如下
+ ![alt text](image.png)
+#### 解题过程
+**1 数据分析**
+pid_to_info_all.json 分析
+pid_to_info_all.json包含了多篇论文的详细信息。每篇论文的条目具有以下结构：
+id：论文的唯一标识符。
+title：论文标题。
+abstract：论文摘要。
+keywords：与论文相关的关键词列表。
+authors：作者列表，包括作者姓名和所属机构。
+venue：论文发表的会议或期刊。
+year：发表年份。
+train_author.json 分析
+train_author.json包含两个主要部分：normal_data（正确的数据）和 outliers（错误的数据）。其中，每个条目表示一篇论文，正确数据远远比错误数据多。
+
+**2 特征分析**
+首先，每篇论文的特征包含标题、摘要、关键词、作者、地点、机构和年份(title,abstract,keywords,authors,venue,year)，这些特征可以概括为两种类型：
+语义特征：包括标题和摘要，这些文本特征可以使用语义表征学习模型转化为语义向量。
+离散特征：包括作者、年份、地点和机构。这些特征本身的文本信息没有太大价值，但它们能转化为论文之间的关系，最终表征为关系向量。最后将标题和摘要也加入了其中。
+图特征：作者。将一篇文章的共同作者转为作者之间的关系。
+
+此外，机构中包含很多地名和组织名，是一个用来划分不同作者的强影响因素。地点和机构也具有弱语义关系，因此既可以纳入语义向量的表征中，也可以纳入关系向量的表征中。
+
+**3算法设计与实现**
+3.1特征工程
+bert_feats 使用bert-base-uncased模型提取标题和摘要的CLS特征
+认为论文的标题和摘要有着相当重要的信息，所以对输入的文本进行标记化处理，生成模型所需的输入张量并通过bert-base-uncased模型进行前向传播，计算得到输出结果。并将结果中的 [CLS] 向量保存为Numpy数组，以下为具体代码：
+```
+def get_cls_embedding(text, model=model, tokenizer=tokenizer):
+   
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
+    
+    inputs = tokenizer(text, return_tensors='pt', padding=True, truncation=True, max_length=512)
+    inputs = {name: tensor.to(device) for name, tensor in inputs.items()}
+    
+    with torch.no_grad():
+        outputs = model(**inputs)
+    
+    cls_embedding = outputs.last_hidden_state[:, 0, :]
+    
+    if device.type == "cuda":
+        cls_embedding = cls_embedding.cpu()
+    return cls_embedding.numpy()[0]
+```
+
+3.2 将关系保存成图
+对于每一篇论文，为每篇论文的作者构建一个图，其中图中的节点代表作者，边表示合作关系。
+图特征的提取：获取图中的所有节点和边。计算每个节点的度（degree），作为节点的特征。
+图神经网络（GNN）的使用：使用图卷积网络（GCN）对图进行处理。将节点的度作为输入特征，通过两层图卷积网络进行嵌入映射。
+以下为具体代码：
+```
+# 提取图关系网络
+coauthor_graph = nx.Graph()
+for author_id, author_info in train_author.items():
+    papers = author_info['normal_data']
+    for paper_id in papers:
+        authors = pid_to_info[paper_id]['authors']
+        for coauthor in authors:
+            if coauthor['name'] != author_info['name']:
+                coauthor_graph.add_edge(author_info['name'], coauthor['name'])
+```
+
+4 训练与预测
+将训练集和测试集的论文与论文集合中的论文信息对应上，再将先前提到的语义特征和离散特征作为每一篇论文的参数，生成训练集和数据集，并对其进行十折交叉训练，使用了10折lightgbm模型
+以下为对于不同特征的处理方法：
+语义特征
+title：使用get_cls_embedding()函数提取语义特征
+abstract：使用get_cls_embedding()函数提取语义特征
+离散特征
+title：提取向量长度
+abstract：取向量长度
+keywords：取向量长度
+authors：取向量长度
+venue：提取数量
+year：计算时间跨度
+在最后，将所有提取的向量结合为一个大的数据集
+
+数据集
+```
+basic_feats = np.array(basic_feats)
+bert_feats = np.array(bert_feats)
+graph_feats = np.array(graph_feats)
+train_feats = np.concatenate([basic_feats, bert_feats,graph_feats], axis=1)
+```
+验证集
+```
+# 合并所有特征
+basic_valid_feats = np.array(basic_valid_feats)
+bert_valid_feats = np.array(bert_valid_feats)
+graph_valid_feats = np.array(graph_valid_feats)
+
+# 合并所有的特征
+valid_feats = np.concatenate([basic_valid_feats, bert_valid_feats, graph_valid_feats], axis=1)
+
+```
+
+#### 结果效果
+最终的结果为0.63745，并未达到baseline代码的水准，但在训练集中，可以达到0.8甚至0.9的成绩，我认为其缺乏泛化能力。
+**原因**
+查看了数据集后和代码后得出以下结论
+1数据集中正确分类文章的比例远远大于错误的比例，导致模型对错误信息的敏感度不够
+2这是一个分类任务，需要判断是正确还是错误，对于得分偏向0.5的文章，是没有意义的答案
+3数据集与测试集的作者中有着不重叠的部分，代码无法对这部分作者准确的识别
